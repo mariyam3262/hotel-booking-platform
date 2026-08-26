@@ -10,6 +10,31 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: hotel_management
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SECRET_KEY: dummy-ci-secret-key
+      DEBUG: "True"
+      DB_NAME: hotel_management
+      DB_USER: postgres
+      DB_PASSWORD: admin
+      DB_HOST: localhost
+      DB_PORT: 5432
+      REDIS_URL: redis://localhost:6379
+
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -22,14 +47,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Enable btree_gist extension
+        run: |
+          PGPASSWORD=admin psql -h localhost -U postgres -d hotel_management -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+
+      - name: Run migrations
+        run: python manage.py migrate
+
       - name: Django system check
         run: python manage.py check
-        env:
-          SECRET_KEY: dummy-ci-secret-key
-          DEBUG: "True"
-          DB_NAME: hotel_management
-          DB_USER: postgres
-          DB_PASSWORD: admin
-          DB_HOST: localhost
-          DB_PORT: 5432
-          REDIS_URL: redis://localhost:6379
