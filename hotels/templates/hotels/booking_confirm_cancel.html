@@ -1,0 +1,5 @@
+    <form method="post">
+  {% csrf_token %}
+  <p>Cancel booking for {{ booking.guest.full_name }}?</p>
+  <button type="submit">Confirm Cancel</button>
+</form>
