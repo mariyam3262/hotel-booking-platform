@@ -1,18 +1,31 @@
 import hashlib
+import json
 
 from django.core.cache import cache
 from django.shortcuts import render, get_object_or_404, redirect
+from django.conf import settings
+from django.http import StreamingHttpResponse, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 
 from rest_framework import viewsets, permissions
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.response import Response
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
-from .models import Property, Room, Booking, Guest, RoomType
+from pgvector.django import CosineDistance
+from google import genai
+from google.genai import types
+
+from .models import Property, Room, Booking, Guest, RoomType, Membership, Review
 from .forms import BookingForm, GuestForm
-from .serializers import PropertySerializer, BookingSerializer, RoomSerializer
+from .serializers import PropertySerializer, BookingSerializer, RoomSerializer, MembershipSerializer,  RoomTypeWriteSerializer, RoomWriteSerializer
+from .permissions import IsPropertyMember
+from .throttles import AIEndpointThrottle
+from .services import build_concierge_context
 
 
-# ---- Function-based views (Days 1-3) ----
+# ---- Function-based views (Days 1-3) — kept for reference, superseded by Vue + API in Phase 7 ----
 
 def property_list(request):
     properties = Property.objects.all()
@@ -71,18 +84,28 @@ def booking_cancel(request, pk):
     return render(request, "hotels/booking_confirm_cancel.html", {"booking": booking})
 
 
-from .permissions import IsPropertyMember
-from .models import Membership
+# ---- DRF ViewSets ----
 
 class PropertyViewSet(viewsets.ModelViewSet):
     serializer_class = PropertySerializer
     permission_classes = [permissions.IsAuthenticated, IsPropertyMember]
 
     def get_queryset(self):
-        # list should only show properties the user is actually a member of
         member_property_ids = Membership.objects.filter(user=self.request.user).values_list("property_id", flat=True)
         return Property.objects.filter(id__in=member_property_ids).prefetch_related("room_types__rooms")
 
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, organization=self._get_or_create_org())
+
+    def _get_or_create_org(self):
+        # for now, every user's properties belong to one org named after them —
+        # a real multi-org product would let the user pick/create this explicitly
+        from .models import Organization
+        org, _ = Organization.objects.get_or_create(
+            name=f"{self.request.user.username}'s Organization",
+            slug=f"org-{self.request.user.id}",
+        )
+        return org
 
 class BookingViewSet(viewsets.ModelViewSet):
     serializer_class = BookingSerializer
@@ -93,6 +116,38 @@ class BookingViewSet(viewsets.ModelViewSet):
         return Booking.objects.filter(
             room__room_type__property_id__in=member_property_ids
         ).select_related("room__room_type__property", "guest")
+
+
+class RoomTypeViewSet(viewsets.ModelViewSet):
+    serializer_class = RoomTypeWriteSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        member_property_ids = Membership.objects.filter(user=self.request.user).values_list("property_id", flat=True)
+        return RoomType.objects.filter(property_id__in=member_property_ids)
+
+    def perform_create(self, serializer):
+        property_obj = serializer.validated_data["property"]
+        is_member = Membership.objects.filter(property=property_obj, user=self.request.user).exists()
+        if not is_member:
+            raise serializers.ValidationError("You do not have access to this property.")
+        serializer.save()
+
+
+class RoomViewSet(viewsets.ModelViewSet):
+    serializer_class = RoomWriteSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        member_property_ids = Membership.objects.filter(user=self.request.user).values_list("property_id", flat=True)
+        return Room.objects.filter(room_type__property_id__in=member_property_ids)
+
+    def perform_create(self, serializer):
+        room_type = serializer.validated_data["room_type"]
+        is_member = Membership.objects.filter(property=room_type.property, user=self.request.user).exists()
+        if not is_member:
+            raise serializers.ValidationError("You do not have access to this property.")
+        serializer.save()
 
 
 # ---- Availability search (cached) ----
@@ -136,3 +191,174 @@ def check_availability(request):
     data = RoomSerializer(available_rooms, many=True).data
     cache.set(cache_key, data, timeout=60)
     return Response(data)
+
+
+# ---- AI: semantic review search ----
+
+@api_view(["POST"])
+@permission_classes([permissions.IsAuthenticated])
+@throttle_classes([AIEndpointThrottle])
+def semantic_review_search(request):
+    query = request.data.get("query")
+    property_id = request.data.get("property_id")
+
+    if not query or not property_id:
+        return Response({"error": "query and property_id are required"}, status=400)
+
+    property_obj = get_object_or_404(Property, pk=property_id)
+    is_member = Membership.objects.filter(property=property_obj, user=request.user).exists()
+    if not is_member:
+        return Response({"error": "You do not have access to this property."}, status=403)
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    result = client.models.embed_content(model="gemini-embedding-001", contents=query)
+    query_embedding = result.embeddings[0].values
+
+    reviews = (
+        Review.objects.filter(property=property_obj, embedding__isnull=False)
+        .annotate(distance=CosineDistance("embedding", query_embedding))
+        .order_by("distance")[:10]
+    )
+
+    data = [
+        {"id": r.id, "rating": r.rating, "body": r.body, "distance": r.distance}
+        for r in reviews
+    ]
+    return Response(data)
+
+
+# ---- AI: RAG concierge (non-streaming, cached) ----
+
+def _concierge_cache_key(property_id, question):
+    normalized = question.strip().lower()
+    raw = f"{property_id}:{normalized}"
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    return f"concierge:{digest}"
+
+
+@api_view(["POST"])
+@permission_classes([permissions.IsAuthenticated])
+@throttle_classes([AIEndpointThrottle])
+def ask_concierge(request):
+    question = request.data.get("question")
+    property_id = request.data.get("property_id")
+
+    if not question or not property_id:
+        return Response({"error": "question and property_id are required"}, status=400)
+
+    property_obj = get_object_or_404(Property, pk=property_id)
+    is_member = Membership.objects.filter(property=property_obj, user=request.user).exists()
+    if not is_member:
+        return Response({"error": "You do not have access to this property."}, status=403)
+
+    cache_key = _concierge_cache_key(property_id, question)
+    cached = cache.get(cache_key)
+    if cached:
+        return Response({**cached, "cached": True})
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    context_block, sources = build_concierge_context(client, property_obj, question)
+
+    prompt = (
+        "You are a helpful hotel concierge. Answer the guest's question using "
+        "ONLY the information below. If the information doesn't answer the "
+        "question, say so honestly and suggest they contact the front desk "
+        "directly, rather than guessing.\n\n"
+        f"--- PROPERTY INFORMATION ---\n{context_block}\n--- END ---\n\n"
+        f"Guest question: {question}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=10_000),
+            ),
+        )
+    except Exception:
+        return Response(
+            {"answer": "The concierge service is temporarily unavailable. Please try again shortly.", "error": True},
+            status=503,
+        )
+
+    result = {"answer": response.text, "sources": sources}
+    cache.set(cache_key, result, timeout=600)
+    return Response(result)
+
+
+# ---- AI: RAG concierge (streaming, SSE) ----
+
+from rest_framework_simplejwt.exceptions import InvalidToken, AuthenticationFailed
+
+def _authenticate(request):
+    auth = JWTAuthentication()
+    try:
+        result = auth.authenticate(request)
+    except (InvalidToken, AuthenticationFailed):
+        return None
+    if result is None:
+        return None
+    user, _ = result
+    return user
+
+
+@csrf_exempt
+@require_POST
+def ask_concierge_stream(request):
+    user = _authenticate(request)
+    if user is None:
+        return JsonResponse({"error": "Authentication required"}, status=401)
+
+    body = json.loads(request.body)
+    question = body.get("question")
+    property_id = body.get("property_id")
+
+    if not question or not property_id:
+        return JsonResponse({"error": "question and property_id are required"}, status=400)
+
+    property_obj = get_object_or_404(Property, pk=property_id)
+    is_member = Membership.objects.filter(property=property_obj, user=user).exists()
+    if not is_member:
+        return JsonResponse({"error": "You do not have access to this property."}, status=403)
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    context_block, sources = build_concierge_context(client, property_obj, question)
+
+    def event_stream():
+        yield f"data: {json.dumps({'type': 'sources', **sources})}\n\n"
+
+        prompt = (
+            "You are a helpful hotel concierge. Answer using ONLY the "
+            "information below. If unclear, say so honestly rather than "
+            "guessing.\n\n"
+            f"--- PROPERTY INFORMATION ---\n{context_block}\n--- END ---\n\n"
+            f"Guest question: {question}"
+        )
+
+        stream = client.models.generate_content_stream(model="gemini-3.6-flash", contents=prompt)
+        for chunk in stream:
+            if chunk.text:
+                yield f"data: {json.dumps({'type': 'answer_chunk', 'text': chunk.text})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+class MembershipViewSet(viewsets.ModelViewSet):
+    serializer_class = MembershipSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        member_property_ids = Membership.objects.filter(user=self.request.user).values_list('property_id', flat=True)
+        return Membership.objects.filter(property_id__in=member_property_ids).select_related('user')
+
+    def perform_create(self, serializer):
+        property_obj = serializer.validated_data['property']
+        is_member = Membership.objects.filter(property=property_obj, user=self.request.user).exists()
+        if not is_member:
+            raise serializers.ValidationError('You do not have access to this property.')
+        serializer.save()

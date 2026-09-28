@@ -40,6 +40,9 @@ REST_FRAMEWORK = {
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
     "ALLOWED_VERSIONS": ["v1"],
     "DEFAULT_VERSION": "v1",
+    "DEFAULT_THROTTLE_RATES": {
+        "ai_endpoint": "10/minute",
+    },
 }
 
 SIMPLE_JWT = {
@@ -59,14 +62,16 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    "corsheaders",
     "django_celery_beat",
     'rest_framework',
     "rest_framework_simplejwt.token_blacklist",
-
+   
     'hotels',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -77,6 +82,10 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'core.urls'
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+]   
 
 TEMPLATES = [
     {
@@ -167,3 +176,15 @@ CELERY_TIMEZONE = "UTC"
 
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 EMAIL_HOST = "nonexistent.invalid.host"
+
+GEMINI_API_KEY = config("GEMINI_API_KEY")
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": f"{REDIS_URL}/1",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        },
+    }
+}

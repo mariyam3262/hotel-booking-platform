@@ -25,7 +25,9 @@ class Property(models.Model):
     address = models.TextField()
     city = models.CharField(max_length=100)
     country = models.CharField(max_length=100)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="properties_created")
     created_at = models.DateTimeField(auto_now_add=True)
+    ai_description = models.TextField(blank=True)
 
     def __str__(self):
         return f"{self.name} ({self.city})"
@@ -153,6 +155,8 @@ class Payment(models.Model):
         return f"Payment {self.amount} for {self.booking}"
 
 
+from pgvector.django import VectorField, HnswIndex
+
 class Review(models.Model):
     property = models.ForeignKey(Property, on_delete=models.CASCADE, related_name="reviews")
     guest = models.ForeignKey(Guest, on_delete=models.CASCADE, related_name="reviews")
@@ -160,6 +164,18 @@ class Review(models.Model):
     rating = models.PositiveSmallIntegerField()  # 1-5
     body = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+    embedding = VectorField(dimensions=768, null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            HnswIndex(
+                name="review_embedding_hnsw_idx",
+                fields=["embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            ),
+        ]
 
     def __str__(self):
         return f"{self.rating}★ — {self.property} by {self.guest}"
@@ -186,3 +202,6 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.user} {self.action} {self.model_name}#{self.object_id}"
+
+    
+    

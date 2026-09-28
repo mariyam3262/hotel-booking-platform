@@ -15,6 +15,14 @@ class RoomSerializer(serializers.ModelSerializer):
         model = Room
         fields = ["id", "room_number", "floor", "is_active"]
 
+class RoomDetailSerializer(serializers.ModelSerializer):
+    """Nested, read-only room representation for booking display."""
+    room_type_name = serializers.CharField(source="room_type.name", read_only=True)
+
+    class Meta:
+        model = Room
+        fields = ["id", "room_number", "room_type_name"]
+
 
 class RoomTypeSerializer(serializers.ModelSerializer):
     rooms = RoomSerializer(many=True, read_only=True)
@@ -34,10 +42,11 @@ class PropertySerializer(serializers.ModelSerializer):
 
 class BookingSerializer(serializers.ModelSerializer):
     guest = GuestSerializer()
+    room_detail = RoomDetailSerializer(source="room", read_only=True)
 
     class Meta:
         model = Booking
-        fields = ["id", "room", "guest", "check_in", "check_out", "status", "total_price", "created_at"]
+        fields = ["id", "room", "room_detail", "guest", "check_in", "check_out", "status", "total_price", "created_at"]
         read_only_fields = ["status", "created_at"]
 
     def validate(self, data):
@@ -113,3 +122,31 @@ class BookingSerializer(serializers.ModelSerializer):
                 changes=changes,
             )
         return instance
+
+class RoomTypeWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RoomType
+        fields = ["id", "property", "name", "description", "base_price_per_night", "max_occupancy"]
+
+
+class RoomWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Room
+        fields = ["id", "room_type", "room_number", "floor", "is_active"]
+
+
+class MembershipSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source="user.username", read_only=True)
+    user_username = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = Membership
+        fields = ["id", "property", "user_username", "username", "role"]
+
+    def create(self, validated_data):
+        username = validated_data.pop("user_username")
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            raise serializers.ValidationError(f"No user found with username '{username}'.")
+        return Membership.objects.create(user=user, **validated_data)

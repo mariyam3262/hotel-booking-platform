@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #12181F;
+  --color-panel: #1B2430;
+  --color-brass: #C6A15B;
+  --color-ivory: #EDE8DE;
+  --color-slate: #8B93A1;
+  --color-clay: #C4593F;
+
+  --font-display: "Fraunces", serif;
+  --font-body: "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+/* consistent, visible focus ring across every interactive element,
+   replacing the browser default which clashes with the dark theme */
+:focus-visible {
+  outline: 2px solid var(--color-brass);
+  outline-offset: 2px;
+}
+
+/* form inputs already get a border-color change on focus via Tailwind
+   classes, so avoid a doubled-up ring on top of that */
+input:focus-visible,
+textarea:focus-visible {
+  outline: none;
+}
+
+
+/* any element with a click handler styled as interactive should show a pointer,
+   not just native buttons/links */
+[class*="cursor-pointer"] {
+  cursor: pointer;
+}
