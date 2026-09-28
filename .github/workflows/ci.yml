@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_DB: hotel_management
           POSTGRES_USER: postgres
@@ -34,6 +34,7 @@ jobs:
       DB_HOST: localhost
       DB_PORT: 5432
       REDIS_URL: redis://localhost:6379
+      GEMINI_API_KEY: dummy-ci-gemini-key
 
     steps:
       - name: Check out code
@@ -47,9 +48,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Enable btree_gist extension
+      - name: Enable Postgres extensions
         run: |
           PGPASSWORD=admin psql -h localhost -U postgres -d hotel_management -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+          PGPASSWORD=admin psql -h localhost -U postgres -d hotel_management -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
       - name: Run migrations
         run: python manage.py migrate
